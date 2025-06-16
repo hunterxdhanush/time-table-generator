@@ -75,11 +75,28 @@ SLOT_LABELS = [
 ]
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
+# --- Helper for 12hr time format ---
+def to_12hr(t):
+    return t.strftime('%I:%M %p').lstrip('0').replace(' 0', ' ')
+
+# Custom slot labels in 12hr format
+SLOT_LABELS_12HR = [f"{to_12hr(slot[0])} - {to_12hr(slot[1])}" for slot in CUSTOM_SLOTS]
+# Insert tea break and lunch break as columns at correct positions
+BREAK_COLUMNS = [
+    ("10:00 AM - 10:30 AM", "Tea Break", 2),  # after 9:00-10:00
+    ("12:30 PM - 2:00 PM", "Lunch Break", 4), # after 11:30-12:30
+]
+all_columns = SLOT_LABELS_12HR.copy()
+for break_time, break_name, idx in sorted(BREAK_COLUMNS, key=lambda x: -x[2]):
+    all_columns.insert(idx, f"{break_name}\n({break_time})")
+
 # --- Session State for config persistence ---
 if 'last_teachers' not in st.session_state:
     st.session_state['last_teachers'] = None
 if 'last_classes' not in st.session_state:
     st.session_state['last_classes'] = None
+if 'timetable_generated' not in st.session_state:
+    st.session_state.timetable_generated = False
 
 # --- Load last config ---
 if st.button("Load Last Configuration"):
@@ -117,16 +134,10 @@ for i in range(int(num_teachers)):
         with col2:
             end_hour = st.number_input(f"End hour (24h)", min_value=0, max_value=23, value=teachers[i]["working_hours"][1] if i < len(teachers) else 15, key=f"teacher_end_{i}")
         working_hours = (start_hour, end_hour)
-        # Multi-select for classes taught
-        classes_taught = st.multiselect(
-            f"Classes taught by {name or f'Teacher {i+1}'}",
-            options=class_names_for_teacher,
-            default=teachers[i]["classes_taught"] if i < len(teachers) and "classes_taught" in teachers[i] else []
-        )
         if i < len(teachers):
-            teachers[i] = {"name": name, "subjects": subjects, "working_hours": working_hours, "classes_taught": classes_taught}
+            teachers[i] = {"name": name, "subjects": subjects, "working_hours": working_hours}
         else:
-            teachers.append({"name": name, "subjects": subjects, "working_hours": working_hours, "classes_taught": classes_taught})
+            teachers.append({"name": name, "subjects": subjects, "working_hours": working_hours})
 
 # --- Input: Class Details ---
 st.subheader("Class Details")
@@ -136,7 +147,7 @@ for i in range(int(num_classes)):
         num_subjects = st.number_input(f"Number of subjects for {class_name or f'Class {i+1}'}", min_value=1, step=1, key=f"class_num_subjects_{i}", value=len(classes[i]["subjects"]) if i < len(classes) and isinstance(classes[i]["subjects"], list) else 1)
         class_subjects = []
         for s in range(int(num_subjects)):
-            col1, col2, col3, col4 = st.columns([2,2,1,1])
+            col1, col2, col3 = st.columns([2,2,1])
             with col1:
                 subject = st.text_input(f"Subject {s+1} Name", key=f"class_{i}_subject_{s}_name", value=classes[i]["subjects"][s]["name"] if i < len(classes) and s < len(classes[i]["subjects"]) and isinstance(classes[i]["subjects"][s], dict) else "")
             with col2:
@@ -144,10 +155,8 @@ for i in range(int(num_classes)):
                 teacher = st.selectbox(f"Teacher for {subject or f'Subject {s+1}'}", teacher_options, key=f"class_{i}_subject_{s}_teacher", index=teacher_options.index(classes[i]["subjects"][s]["teacher"]) if i < len(classes) and s < len(classes[i]["subjects"]) and isinstance(classes[i]["subjects"][s], dict) and classes[i]["subjects"][s]["teacher"] in teacher_options else 0)
             with col3:
                 periods = st.number_input(f"Periods", min_value=1, step=1, key=f"class_{i}_subject_{s}_periods", value=classes[i]["subjects"][s]["periods"] if i < len(classes) and s < len(classes[i]["subjects"]) and isinstance(classes[i]["subjects"][s], dict) and "periods" in classes[i]["subjects"][s] else 1)
-            with col4:
-                hours = st.number_input(f"Hours/week", min_value=1, step=1, key=f"class_{i}_subject_{s}_hours", value=classes[i]["subjects"][s]["hours"] if i < len(classes) and s < len(classes[i]["subjects"]) and isinstance(classes[i]["subjects"][s], dict) and "hours" in classes[i]["subjects"][s] else periods)
             if subject and teacher:
-                class_subjects.append({"name": subject, "teacher": teacher, "periods": periods, "hours": hours})
+                class_subjects.append({"name": subject, "teacher": teacher, "periods": periods})
         if i < len(classes):
             classes[i] = {"name": class_name, "subjects": class_subjects}
         else:
@@ -166,8 +175,7 @@ if teachers:
         {
             "Name": t["name"],
             "Subjects": ", ".join(t["subjects"]),
-            "Working Hours": f"{t['working_hours'][0]}:00 - {t['working_hours'][1]}:00",
-            "Classes Taught": ", ".join(t["classes_taught"]) if "classes_taught" in t else ""
+            "Working Hours": f"{t['working_hours'][0]}:00 - {t['working_hours'][1]}:00"
         }
         for t in teachers
     ])
@@ -180,7 +188,7 @@ if classes:
     classes_df = pd.DataFrame([
         {
             "Class Name": c["name"],
-            "Subjects": ", ".join(f"{s['name']} ({s['teacher']}, {s['periods']} periods, {s['hours']} hours)" for s in c["subjects"])
+            "Subjects": ", ".join(f"{s['name']} ({s['teacher']}, {s['periods']} periods)" for s in c["subjects"])
         }
         for c in classes
     ])
@@ -238,36 +246,40 @@ if st.button("Generate Timetable"):
         class_subjects = []
         for subj in c["subjects"]:
             for _ in range(int(subj["periods"])):
-                class_subjects.append({"subject": subj["name"], "teacher": subj["teacher"]})
+                class_subjects.append({"name": subj["name"], "teacher": subj["teacher"], "periods": subj["periods"]})
         subjects.append(class_subjects)
-    # Run CSP
-    csp = TimetableCSP(class_names, teacher_objs, subjects, slot_minutes=60, custom_slots=CUSTOM_SLOTS)
+
+    # Run CSP for the whole week
+    csp = TimetableCSP(class_names, teacher_objs, subjects, slot_minutes=60, custom_slots=CUSTOM_SLOTS, days=DAYS)
+    
     timetable = csp.solve()
     if timetable is None:
         st.error("No valid timetable could be generated with the given constraints.")
+        st.session_state.timetable_generated = False
     else:
-        # Collect all unique time slots
+        st.session_state.timetable_generated = True
+        # Collect all unique (day, slot) pairs
         all_slots = set()
         for class_entries in timetable.values():
             for entry in class_entries:
                 all_slots.add(entry["slot"])
-        all_slots = sorted(list(all_slots), key=lambda x: (x[0], x[1]))
+        all_slots = sorted(list(all_slots), key=lambda x: (DAYS.index(x[0]), x[1][0], x[1][1]))
         # Ensure unique class names and slot labels
         unique_class_names = make_unique(class_names)
-        slot_labels = [f"{slot[0].strftime('%H:%M')} - {slot[1].strftime('%H:%M')}" for slot in all_slots]
+        slot_labels = [f"{day} {slot[0].strftime('%H:%M')} - {slot[1].strftime('%H:%M')}" for (day, slot) in all_slots]
         unique_slot_labels = make_unique_labels(slot_labels)
         # Build DataFrame: rows=unique_class_names, columns=unique_slot_labels
         data = {label: [] for label in unique_slot_labels}
-        for slot, col_label in zip(all_slots, unique_slot_labels):
+        for (day_slot), col_label in zip(all_slots, unique_slot_labels):
             for idx, class_name in enumerate(unique_class_names):
                 orig_class_name = class_names[idx]
-                entry = next((e for e in timetable[orig_class_name] if e["slot"] == slot), None)
+                entry = next((e for e in timetable[orig_class_name] if e["slot"] == day_slot), None)
                 if entry:
                     data[col_label].append(f"{entry['subject']} - {entry['teacher']}")
                 else:
                     data[col_label].append("")
         df = pd.DataFrame(data, index=unique_class_names)
-        st.subheader("Generated Timetable (All Slots)")
+        st.subheader("Generated Timetable (All Slots, Whole Week)")
         # --- Color coding subjects ---
         def subject_color(val):
             if not val or '-' not in val:
@@ -281,70 +293,121 @@ if st.button("Generate Timetable"):
         csv = df.to_csv().encode('utf-8')
         st.download_button("Download Timetable as CSV", data=csv, file_name="timetable.csv", mime="text/csv")
         # --- Visualization of free/busy slots for teachers ---
-        st.subheader("Teacher Free/Busy Visualization")
+        st.subheader("Teacher Free/Busy Visualization (Whole Week)")
         for t in teacher_objs:
-            t_slots = [f"{slot[0].strftime('%H:%M')} - {slot[1].strftime('%H:%M')}" for slot in CUSTOM_SLOTS]
+            t_slots = [f"{day} {slot[0].strftime('%H:%M')} - {slot[1].strftime('%H:%M')}" for day in DAYS for slot in CUSTOM_SLOTS]
             busy = set()
             for class_entries in timetable.values():
                 for entry in class_entries:
                     if entry['teacher'] == t['name']:
-                        busy.add(f"{entry['slot'][0].strftime('%H:%M')} - {entry['slot'][1].strftime('%H:%M')}")
+                        busy.add(f"{entry['slot'][0]} {entry['slot'][1][0].strftime('%H:%M')} - {entry['slot'][1][1].strftime('%H:%M')}")
             status = ["🟩 Free" if slot not in busy else "🟥 Busy" for slot in t_slots]
             vis_df = pd.DataFrame({"Slot": t_slots, "Status": status})
             st.markdown(f"**{t['name']}**")
             st.dataframe(vis_df)
-        # --- Visualize timetable for each class by day/period (Mon-Sat, less hectic Saturday) ---
-        st.subheader("Class Timetables (by Day and Period, Mon-Sat, Saturday Less Hectic)")
-        periods_per_day = len(CUSTOM_SLOTS)
-        for class_name in class_names:
+        # --- Visualize timetable for each class using the default table structure (with breaks) ---
+        st.subheader("Class Timetables (Default Table Structure, With Breaks)")
+        # Helper: map slot (day, period) to subject-teacher for each class
+        for class_idx, class_name in enumerate(class_names):
             class_entries = timetable[class_name]
-            slot_to_entry = {entry['slot']: f"{entry['subject']}\n{entry['teacher']}" for entry in class_entries}
-            grid = [["" for _ in range(len(DAYS))] for _ in range(periods_per_day)]
-            for day_idx, day in enumerate(DAYS):
-                for period_idx, slot in enumerate(CUSTOM_SLOTS):
-                    slot_val = slot_to_entry.get(slot, "")
-                    grid[period_idx][day_idx] = slot_val
-            df_grid = pd.DataFrame(grid, columns=DAYS, index=SLOT_LABELS)
-            st.markdown(f"**{class_name}**")
-            st.dataframe(df_grid)
+            slot_to_entry = {(entry['slot'][0], entry['slot'][1]): f"{entry['subject']}<br><small>{entry['teacher']}</small>" for entry in class_entries}
+            # Build HTML table for this class
+            html = "<style>td,th {text-align:center;vertical-align:middle;} .break-col {font-weight:bold;writing-mode:vertical-rl;text-orientation: mixed;} .break-header {white-space:pre-line;}</style>"
+            html += "<table border='1' style='border-collapse:collapse;width:100%'>"
+            # Header
+            html += "<tr><th>Day/Time</th>"
+            for col in all_columns:
+                if any(col.startswith(b[1]) for b in BREAK_COLUMNS):
+                    html += f"<th class='break-header'>{col}</th>"
+                else:
+                    html += f"<th>{col}</th>"
+            html += "</tr>"
+            for day in DAYS:
+                html += f"<tr><td><b>{day}</b></td>"
+                period_idx = 0
+                for col in all_columns:
+                    if col.startswith("Tea Break"):
+                        html += f"<td class='break-col' rowspan='{len(DAYS)}'><div style='height:120px;display:flex;align-items:center;justify-content:center;'><span style='font-size:1.2em;writing-mode:vertical-rl;text-orientation:mixed;'>Tea Break</span></div></td>" if day == DAYS[0] else ""
+                    elif col.startswith("Lunch Break"):
+                        html += f"<td class='break-col' rowspan='{len(DAYS)}'><div style='height:120px;display:flex;align-items:center;justify-content:center;'><span style='font-size:1.2em;writing-mode:vertical-rl;text-orientation:mixed;'>Lunch Break</span></div></td>" if day == DAYS[0] else ""
+                    else:
+                        # This is a period column
+                        if period_idx < len(CUSTOM_SLOTS):
+                            slot_val = slot_to_entry.get((day, CUSTOM_SLOTS[period_idx]), "")
+                            html += f"<td>{slot_val}</td>"
+                        else:
+                            html += "<td></td>"
+                        period_idx += 1
+                html += "</tr>"
+            html += "</table>"
+            if class_idx == 0:
+                st.markdown(f"**{class_name}**")
+            else:
+                st.markdown(f"**{class_name}**")
+            st.markdown(html, unsafe_allow_html=True)
+            # Add download button for this class's timetable
+            class_df = pd.DataFrame(index=DAYS, columns=all_columns)
+            for day in DAYS:
+                period_idx = 0
+                for col in all_columns:
+                    if any(col.startswith(b[1]) for b in BREAK_COLUMNS):
+                        # This is a break column
+                        class_df.loc[day, col] = col.split('\n')[0].strip() # Just the break name
+                    else:
+                        # This is a period column
+                        if period_idx < len(CUSTOM_SLOTS):
+                            slot_val = slot_to_entry.get((day, CUSTOM_SLOTS[period_idx]), "")
+                            class_df.loc[day, col] = slot_val.replace('<br><small>', ' (').replace('</small>', ')')
+                        else:
+                            class_df.loc[day, col] = ""
+                        period_idx += 1
+            csv_for_class = class_df.to_csv().encode('utf-8')
+            st.download_button(
+                label=f"Download Timetable for {class_name}",
+                data=csv_for_class,
+                file_name=f"timetable_{class_name.replace(' ', '_')}.csv",
+                mime="text/csv",
+                key=f"download_class_timetable_{class_idx}"
+            )
 
-# --- Default Timetable Example (Blank Template with Breaks as Columns, 12hr format, merged cells, normal background, show break time) ---
-def to_12hr(t):
-    return t.strftime('%I:%M %p').lstrip('0').replace(' 0', ' ')
+if not st.session_state.timetable_generated:
+    # Default Timetable Example (Blank Template with Breaks as Columns, 12hr format, merged cells, normal background, show break time)
+    def to_12hr(t):
+        return t.strftime('%I:%M %p').lstrip('0').replace(' 0', ' ')
 
-# Custom slot labels in 12hr format
-SLOT_LABELS_12HR = [f"{to_12hr(slot[0])} - {to_12hr(slot[1])}" for slot in CUSTOM_SLOTS]
-# Insert tea break and lunch break as columns at correct positions
-BREAK_COLUMNS = [
-    ("10:00 AM - 10:30 AM", "Tea Break", 2),  # after 9:00-10:00
-    ("12:30 PM - 2:00 PM", "Lunch Break", 4), # after 11:30-12:30
-]
-all_columns = SLOT_LABELS_12HR.copy()
-for break_time, break_name, idx in sorted(BREAK_COLUMNS, key=lambda x: -x[2]):
-    all_columns.insert(idx, f"{break_name}\n({break_time})")
+    # Custom slot labels in 12hr format
+    SLOT_LABELS_12HR = [f"{to_12hr(slot[0])} - {to_12hr(slot[1])}" for slot in CUSTOM_SLOTS]
+    # Insert tea break and lunch break as columns at correct positions
+    BREAK_COLUMNS = [
+        ("10:00 AM - 10:30 AM", "Tea Break", 2),  # after 9:00-10:00
+        ("12:30 PM - 2:00 PM", "Lunch Break", 4), # after 11:30-12:30
+    ]
+    all_columns = SLOT_LABELS_12HR.copy()
+    for break_time, break_name, idx in sorted(BREAK_COLUMNS, key=lambda x: -x[2]):
+        all_columns.insert(idx, f"{break_name}\n({break_time})")
 
-# Build HTML table for merged break columns
-html = "<style>td,th {text-align:center;vertical-align:middle;} .break-col {font-weight:bold;writing-mode:vertical-rl;text-orientation: mixed;} .break-header {white-space:pre-line;}</style>"
-html += "<table border='1' style='border-collapse:collapse;width:100%'>"
-# Header
-html += "<tr><th>Day/Time</th>"
-for col in all_columns:
-    if any(col.startswith(b[1]) for b in BREAK_COLUMNS):
-        # Show break name and time in header, normal background
-        html += f"<th class='break-header'>{col}</th>"
-    else:
-        html += f"<th>{col}</th>"
-html += "</tr>"
-for day in DAYS:
-    html += f"<tr><td><b>{day}</b></td>"
+    # Build HTML table for merged break columns
+    html = "<style>td,th {text-align:center;vertical-align:middle;} .break-col {font-weight:bold;writing-mode:vertical-rl;text-orientation: mixed;} .break-header {white-space:pre-line;}</style>"
+    html += "<table border='1' style='border-collapse:collapse;width:100%'>"
+    # Header
+    html += "<tr><th>Day/Time</th>"
     for col in all_columns:
-        if col.startswith("Tea Break"):
-            html += f"<td class='break-col' rowspan='{len(DAYS)}'><div style='height:120px;display:flex;align-items:center;justify-content:center;'><span style='font-size:1.2em;writing-mode:vertical-rl;text-orientation:mixed;'>Tea Break</span></div></td>" if day == DAYS[0] else ""
-        elif col.startswith("Lunch Break"):
-            html += f"<td class='break-col' rowspan='{len(DAYS)}'><div style='height:120px;display:flex;align-items:center;justify-content:center;'><span style='font-size:1.2em;writing-mode:vertical-rl;text-orientation:mixed;'>Lunch Break</span></div></td>" if day == DAYS[0] else ""
+        if any(col.startswith(b[1]) for b in BREAK_COLUMNS):
+            # Show break name and time in header, normal background
+            html += f"<th class='break-header'>{col}</th>"
         else:
-            html += "<td></td>"
+            html += f"<th>{col}</th>"
     html += "</tr>"
-html += "</table>"
-st.subheader("Default Timetable Template (Mon-Sat, Custom Slots, Breaks as Columns, 12hr Format)")
-st.markdown(html, unsafe_allow_html=True) 
+    for day in DAYS:
+        html += f"<tr><td><b>{day}</b></td>"
+        for col in all_columns:
+            if col.startswith("Tea Break"):
+                html += f"<td class='break-col' rowspan='{len(DAYS)}'><div style='height:120px;display:flex;align-items:center;justify-content:center;'><span style='font-size:1.2em;writing-mode:vertical-rl;text-orientation:mixed;'>Tea Break</span></div></td>" if day == DAYS[0] else ""
+            elif col.startswith("Lunch Break"):
+                html += f"<td class='break-col' rowspan='{len(DAYS)}'><div style='height:120px;display:flex;align-items:center;justify-content:center;'><span style='font-size:1.2em;writing-mode:vertical-rl;text-orientation:mixed;'>Lunch Break</span></div></td>" if day == DAYS[0] else ""
+            else:
+                html += "<td></td>"
+        html += "</tr>"
+    html += "</table>"
+    st.subheader("Default Timetable Template (Mon-Sat, Custom Slots, Breaks as Columns, 12hr Format)")
+    st.markdown(html, unsafe_allow_html=True) 
